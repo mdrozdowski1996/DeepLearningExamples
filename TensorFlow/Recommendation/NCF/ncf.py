@@ -46,6 +46,7 @@ from input_pipeline import DataGenerator
 
 from logger.logger import LOGGER
 from logger.autologging import log_args
+from tensorflow.python.compiler.tensorrt import trt_convert as trt
 
 def parse_args():
     """
@@ -108,6 +109,8 @@ def parse_args():
                         help='Perform evaluations only after this many epochs')
     parser.add_argument('--verbose', action='store_true',
                         help='Log the performance and accuracy after every epoch')
+    parser.add_argument('--use_trt', action='store_true')
+    parser.add_argument('--precision_mode', choices=['FP16', 'INT8', 'FP32'])
 
     return parser.parse_args()
 
@@ -239,17 +242,18 @@ def main():
     # Create tensorflow session and saver
     config = tf.ConfigProto()
     config.gpu_options.allow_growth = True
-    config.gpu_options.visible_device_list = str(hvd.local_rank())
+    #config.gpu_options.visible_device_list = str(hvd.local_rank())
     if args.xla:
         config.graph_options.optimizer_options.global_jit_level = tf.OptimizerOptions.ON_1
+    
     sess = tf.Session(config=config)
 
     # Input tensors
-    users = tf.placeholder(tf.int32, shape=(None,))
-    items = tf.placeholder(tf.int32, shape=(None,))
-    labels = tf.placeholder(tf.int32, shape=(None,))
-    is_dup = tf.placeholder(tf.float32, shape=(None,))
-    dropout = tf.placeholder_with_default(args.dropout, shape=())
+    users = tf.placeholder(tf.int32, shape=(None,), name='users')
+    items = tf.placeholder(tf.int32, shape=(None,), name='items')
+    labels = tf.placeholder(tf.int32, shape=(None,), name='labels')
+    is_dup = tf.placeholder(tf.float32, shape=(None,), name='is_dup')
+    dropout = tf.placeholder_with_default(args.dropout, shape=(), name='dropout')
     # Model ops and saver
     hit_rate, ndcg, eval_op, train_op = ncf_model_ops(
         users,
@@ -290,8 +294,49 @@ def main():
     # If test mode, run one eval
     if args.mode == 'test':
         saver.restore(sess, args.checkpoint_dir)
-        eval_start = time.time()
         sess.run(tf.local_variables_initializer())
+        gd = sess.graph_def
+        for node in gd.node:
+            if node.op == 'AssignSub':
+                node.op = 'Sub'
+                if 'use_locking' in node.attr: del node.attr['use_locking']
+            elif node.op == 'AssignAdd':
+                node.op = 'Add'
+                if 'use_locking' in node.attr: del node.attr['use_locking']
+
+        frozen_graph = tf.graph_util.convert_variables_to_constants(
+                           sess,
+                           gd,
+                           output_node_names=['neumf/group_deps'])
+        sess.close()
+        sess = tf.Session(config=config)
+        print([n.name for n in frozen_graph.node])
+        #print(frozen_graph)
+        if args.use_trt:
+            start_time = time.time()
+            #nodes_blacklist=['neumf/hit_rate/total', 'neumf/hit_rate/count',  'neumf/ndcg/total', 'neumf/ndcg/count'],
+            converter = trt.TrtGraphConverter(
+                            input_graph_def=frozen_graph,
+                            max_batch_size=args.batch_size,
+                            nodes_blacklist=['neumf/group_deps'],
+                            precision_mode=args.precision_mode.upper())
+            frozen_graph = converter.convert()
+            print("conversion time", time.time() - start_time)
+        tf.reset_default_graph()
+        print([n.name for n in frozen_graph.node])
+        eval_op = tf.import_graph_def(
+            frozen_graph,
+            input_map={'users': users, 'items': items, 'is_dup': is_dup},
+            return_elements=['neumf/group_deps'])
+        print([n.name for n in tf.get_default_graph()])
+        hr_sum = tf.get_default_graph().get_tensor_by_name('neumf/hit_rate/total:0')
+        hr_cnt = tf.get_default_graph().get_tensor_by_name('neumf/hit_rate/count:0')
+        ndcg_sum = tf.get_default_graph().get_tensor_by_name('neumf/ndcg/total:0')
+        ndcg_cnt = tf.get_default_graph().get_tensor_by_name('neumf/ndcg/count:0')
+        
+        #print([n.name for n in tf.get_default_graph().as_graph_def().node])
+        eval_start = time.time()
+        
         for user_batch, item_batch, dup_batch \
             in zip(data_generator.eval_users, data_generator.eval_items, data_generator.dup_mask):
             sess.run(
